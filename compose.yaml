@@ -1,0 +1,550 @@
+# CRDTs you can read, in a JupyterLab of your own: replicas that go offline, change the
+# same data and still agree when they sync. Counters, a last-writer-wins register, an
+# observed-remove set, vector clocks and a small text CRDT, in a few short files of plain
+# Python.
+#
+# Every replica here is a Python object in one process, and "offline" means two objects
+# that have not been merged yet. Nothing goes over a network, so every run prints the same.
+#
+# Your copy is the only thing you can reach: this lab has no way out to the internet.
+#
+# Open JupyterLab from the lab's page. The work folder holds crdt.py (a G-Counter, a
+# PN-Counter, an LWW-register, an OR-set and vector clocks), rga.py (a text CRDT in the
+# style of RGA, with tombstones), start.ipynb, a notebook to begin from, and steps/, short
+# scripts that each show one idea. The terminal beside the lab reaches the same Python with
+# docker exec, for example
+#   docker exec jupyter python3 steps/orset.py
+#
+# Left out on purpose: a real CRDT library (Automerge, Yjs). No pinned image on an allowed
+# registry carries one, and nothing is downloaded when the lab starts, so the lab models
+# the same ideas in plain Python and the lessons compare them with the libraries in words.
+#
+# Hand in a notebook of your own that uses these files to answer a question you chose (for
+# example whether the merge order ever changes a result, or how many tombstones a busy
+# document keeps), downloaded from JupyterLab with File, Download, and a sentence on what
+# you found.
+#
+# The image runs as its own unprivileged account and needs no capabilities. JupyterLab asks
+# for no token, because the platform's own door in front of it already knows who you are; do
+# not run it like this anywhere else. Nothing is saved: download your notebook before you stop
+# the lab, because stopping it forgets every file you made.
+
+services:
+  jupyter:
+    image: jupyter/scipy-notebook:2023-10-20
+    user: "1000:100"
+    expose: ["8888"]
+    working_dir: /home/jovyan/work
+    environment:
+      HOME: /home/jovyan
+      PYTHONPATH: /home/jovyan/work
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mkdir -p /home/jovyan/work/steps /tmp/lab
+        cd /home/jovyan/work
+        cat > crdt.py <<'PY'
+        """Toy CRDTs: counters, a register, a set and vector clocks, each with a merge.
+
+        Every replica is a plain Python object you can change offline and merge later. A merge is
+        a join: the order of merges does not matter, and merging the same state twice changes
+        nothing. That is why replicas that have seen the same updates end up equal."""
+
+
+        class GCounter:
+            """A grow-only counter: one entry per replica, and only that replica adds to it."""
+
+            def __init__(self, replica):
+                self.replica = replica
+                self.counts = {}
+
+            def increment(self, amount=1):
+                self.counts[self.replica] = self.counts.get(self.replica, 0) + amount
+
+            def value(self):
+                return sum(self.counts.values())
+
+            def merge(self, other):
+                for name, count in other.counts.items():
+                    self.counts[name] = max(self.counts.get(name, 0), count)
+
+
+        class PNCounter:
+            """A counter that can also go down: a G-Counter of ups and a G-Counter of downs."""
+
+            def __init__(self, replica):
+                self.ups = GCounter(replica)
+                self.downs = GCounter(replica)
+
+            def increment(self, amount=1):
+                self.ups.increment(amount)
+
+            def decrement(self, amount=1):
+                self.downs.increment(amount)
+
+            def value(self):
+                return self.ups.value() - self.downs.value()
+
+            def merge(self, other):
+                self.ups.merge(other.ups)
+                self.downs.merge(other.downs)
+
+
+        class LWWRegister:
+            """A last-writer-wins register: the write with the larger (time, replica) stays."""
+
+            def __init__(self, replica):
+                self.replica = replica
+                self.value = None
+                self.stamp = (0, "")
+
+            def set(self, value, time):
+                self.value = value
+                self.stamp = (time, self.replica)
+
+            def merge(self, other):
+                if other.stamp > self.stamp:
+                    self.value = other.value
+                    self.stamp = other.stamp
+
+
+        class ORSet:
+            """An observed-remove set. Every add gets a tag nobody else uses. A remove deletes only
+            the tags it has seen, so an add the remover never saw survives: add wins."""
+
+            def __init__(self, replica):
+                self.replica = replica
+                self.counter = 0
+                self.tags = {}
+                self.removed = set()
+
+            def add(self, element):
+                self.counter += 1
+                self.tags.setdefault(element, set()).add(self.replica + ":" + str(self.counter))
+
+            def remove(self, element):
+                self.removed |= self.tags.pop(element, set())
+
+            def members(self):
+                return sorted(self.tags)
+
+            def merge(self, other):
+                self.removed |= other.removed
+                for element, tags in other.tags.items():
+                    self.tags.setdefault(element, set()).update(tags)
+                for element in list(self.tags):
+                    self.tags[element] -= self.removed
+                    if not self.tags[element]:
+                        del self.tags[element]
+
+
+        def tick(clock, replica):
+            """A copy of the vector clock with this replica's own entry one higher."""
+            out = dict(clock)
+            out[replica] = out.get(replica, 0) + 1
+            return out
+
+
+        def merge_clocks(a, b):
+            """The entry-by-entry maximum of two vector clocks."""
+            return {name: max(a.get(name, 0), b.get(name, 0)) for name in sorted(set(a) | set(b))}
+
+
+        def compare(a, b):
+            """How two vector clocks relate: before, after, equal or concurrent."""
+            names = set(a) | set(b)
+            smaller = any(a.get(name, 0) < b.get(name, 0) for name in names)
+            larger = any(a.get(name, 0) > b.get(name, 0) for name in names)
+            if smaller and larger:
+                return "concurrent"
+            if smaller:
+                return "before"
+            if larger:
+                return "after"
+            return "equal"
+        PY
+        cat > rga.py <<'PY'
+        """A toy sequence CRDT for text, in the style of RGA (a replicated growable array).
+
+        Every character gets an id, (counter, replica), that no other character shares, and it
+        remembers the id of the character it was typed after. So an insert means "after that
+        character", the same on every replica, never "at position 5". A delete only marks the
+        character as gone, a tombstone, because another replica may still type after it."""
+
+        START = (0, "")
+
+
+        class Text:
+            def __init__(self, replica):
+                self.replica = replica
+                self.counter = 0
+                self.chars = {}
+
+            def order(self):
+                """Every id in text order: after its parent, newer siblings first."""
+                children = {}
+                for cid, entry in self.chars.items():
+                    children.setdefault(entry[0], []).append(cid)
+                out = []
+                stack = sorted(children.get(START, []))
+                while stack:
+                    cid = stack.pop()
+                    out.append(cid)
+                    stack.extend(sorted(children.get(cid, [])))
+                return out
+
+            def visible(self):
+                return [cid for cid in self.order() if not self.chars[cid][2]]
+
+            def text(self):
+                return "".join(self.chars[cid][1] for cid in self.visible())
+
+            def insert(self, index, text):
+                """Type text so that its first character lands at visible position index."""
+                ids = self.visible()
+                after = ids[index - 1] if index > 0 else START
+                for char in text:
+                    self.counter += 1
+                    cid = (self.counter, self.replica)
+                    self.chars[cid] = [after, char, False]
+                    after = cid
+
+            def delete(self, index, count=1):
+                for cid in self.visible()[index:index + count]:
+                    self.chars[cid][2] = True
+
+            def merge(self, other):
+                for cid, entry in other.chars.items():
+                    mine = self.chars.get(cid)
+                    if mine is None:
+                        self.chars[cid] = list(entry)
+                    else:
+                        mine[2] = mine[2] or entry[2]
+                    self.counter = max(self.counter, cid[0])
+
+            def tombstones(self):
+                return sum(1 for entry in self.chars.values() if entry[2])
+
+            def compact(self, seen_by_all):
+                """Drop tombstones whose counter every replica has seen, if nothing hangs off them."""
+                removed = 0
+                changed = True
+                while changed:
+                    changed = False
+                    parents = {entry[0] for entry in self.chars.values()}
+                    for cid in list(self.chars):
+                        if self.chars[cid][2] and cid[0] <= seen_by_all and cid not in parents:
+                            del self.chars[cid]
+                            removed += 1
+                            changed = True
+                return removed
+        PY
+        cat > steps/lostedit.py <<'PY'
+        # One note, two devices. Both start from the same copy, then go offline.
+        base = {"title": "Trip", "body": "Pack bags"}
+
+        phone = dict(base)
+        phone["title"] = "Trip to York"      # edited on the train, saved at 10:05
+        phone_saved = 1005
+
+        laptop = dict(base)
+        laptop["body"] = "Pack bags, book hotel"   # edited at home, saved at 10:07
+        laptop_saved = 1007
+
+        # Naive sync: the whole note saved last wins.
+        winner = laptop if laptop_saved > phone_saved else phone
+        print("naive sync keeps:", winner)
+        print("phone's title edit lost:", winner["title"] != phone["title"])
+
+        # Field by field, each field keeps its own last write.
+        merged = dict(base)
+        for copy in (phone, laptop):
+            for field in copy:
+                if copy[field] != base[field]:
+                    merged[field] = copy[field]
+        print("field by field:", merged)
+        PY
+        cat > steps/gcounter.py <<'PY'
+        from crdt import GCounter
+
+        # Three replicas count page views while offline.
+        phone, laptop, tablet = GCounter("phone"), GCounter("laptop"), GCounter("tablet")
+        phone.increment(3)
+        laptop.increment(5)
+        tablet.increment(2)
+        print("before sync:", phone.value(), laptop.value(), tablet.value())
+
+        # Merge in two different orders.
+        phone.merge(laptop)
+        phone.merge(tablet)
+        tablet.merge(phone)
+        laptop.merge(tablet)
+        print("phone sees", phone.value(), phone.counts)
+        print("laptop sees", laptop.value(), laptop.counts)
+
+        # Merging the same state again changes nothing.
+        phone.merge(laptop)
+        phone.merge(laptop)
+        print("after merging twice more:", phone.value())
+
+        # A plain number cannot tell a new view from one it already counted.
+        total = 3
+        total = total + 8   # phone adds what the others reported
+        total = total + 8   # the same report arrives again
+        print("plain number after a repeated message:", total)
+        PY
+        cat > steps/pncounter.py <<'PY'
+        from crdt import PNCounter
+
+        # Likes on a post: people press like and unlike on two devices.
+        a, b = PNCounter("a"), PNCounter("b")
+        a.increment(4)
+        a.decrement(1)
+        b.increment(2)
+        b.decrement(2)
+        print("a alone:", a.value(), " b alone:", b.value())
+        a.merge(b)
+        b.merge(a)
+        print("after sync: a =", a.value(), "b =", b.value())
+        print("ups:", a.ups.counts, "downs:", a.downs.counts)
+        PY
+        cat > steps/register.py <<'PY'
+        from crdt import LWWRegister
+
+        # The colour of a shared board, set on two devices that are offline.
+        phone, laptop = LWWRegister("phone"), LWWRegister("laptop")
+        phone.set("blue", 100)
+        laptop.set("green", 105)
+        phone.merge(laptop)
+        laptop.merge(phone)
+        print("both keep:", phone.value, laptop.value, laptop.stamp)
+
+        # Same time on both: the replica name breaks the tie, the same way everywhere.
+        x, y = LWWRegister("x"), LWWRegister("y")
+        x.set("red", 200)
+        y.set("gold", 200)
+        x.merge(y)
+        y.merge(x)
+        print("tie at 200 keeps:", x.value, y.value)
+
+        # The phone's clock is 10 minutes slow. It writes later but stamps earlier.
+        phone.set("purple", 98)
+        laptop.merge(phone)
+        print("after the slow phone writes purple, laptop keeps:", laptop.value)
+        PY
+        cat > steps/orset.py <<'PY'
+        from crdt import ORSet
+
+        # A shared shopping list on two phones.
+        ana, ben = ORSet("ana"), ORSet("ben")
+        ana.add("milk")
+        ana.add("eggs")
+        ben.merge(ana)
+        print("both start with:", ben.members())
+
+        # Offline: Ana removes milk. Ben, who has not heard, adds milk again.
+        ana.remove("milk")
+        ben.add("milk")
+        print("ana:", ana.members(), " ben:", ben.members())
+
+        ana.merge(ben)
+        ben.merge(ana)
+        print("after sync, ana:", ana.members(), " ben:", ben.members())
+        print("milk tags left:", sorted(ana.tags["milk"]), " removed tags:", sorted(ana.removed))
+
+        # A remove that has seen every add does remove it.
+        ben.remove("milk")
+        ana.merge(ben)
+        print("after Ben removes milk with every tag seen:", ana.members())
+        PY
+        cat > steps/text.py <<'PY'
+        from rga import Text
+
+        # Two people edit the same line, offline.
+        ana, ben = Text("ana"), Text("ben")
+        ana.insert(0, "Hello")
+        ben.merge(ana)
+        print("shared:", ana.text())
+
+        ana.insert(5, " world")    # Ana adds at the end
+        ben.insert(0, "Oh, ")      # Ben adds at the start
+        ben.delete(4)              # and deletes the H
+        print("ana offline:", ana.text())
+        print("ben offline:", ben.text())
+
+        ana.merge(ben)
+        ben.merge(ana)
+        print("after sync, ana:", ana.text())
+        print("after sync, ben:", ben.text())
+        print("first three ids:", ana.order()[:3])
+        print("tombstones kept:", ana.tombstones())
+        PY
+        cat > steps/interleave.py <<'PY'
+        from rga import Text
+
+        # Two people type a word at the same place at the same time.
+        # Idea 1: give every character a number between its neighbours (0 and 1),
+        # and sort by number, then by name. Both pick 0.25, 0.5 and 0.75.
+        ana_chars = [(0.25, "ana", "c"), (0.5, "ana", "a"), (0.75, "ana", "t")]
+        ben_chars = [(0.25, "ben", "d"), (0.5, "ben", "o"), (0.75, "ben", "g")]
+        merged = sorted(ana_chars + ben_chars)
+        print("numbers between neighbours:", "".join(char for pos, who, char in merged))
+
+        # Idea 2: RGA. Each character is typed after the one before it, so a word stays together.
+        ana, ben = Text("ana"), Text("ben")
+        ana.insert(0, "cat")
+        ben.insert(0, "dog")
+        ana.merge(ben)
+        ben.merge(ana)
+        print("RGA:", ana.text(), ben.text())
+        PY
+        cat > steps/clocks.py <<'PY'
+        from crdt import compare, merge_clocks, tick
+
+        # Each replica counts its own events. A message carries the sender's clock.
+        a = tick({}, "a")             # a writes
+        b = tick({}, "b")             # b writes, not having heard from a
+        print("a =", a, " b =", b, " a vs b:", compare(a, b))
+
+        b = merge_clocks(b, a)        # b receives a's write
+        b = tick(b, "b")              # then writes again
+        print("b after hearing a:", b, " a vs b:", compare(a, b))
+
+        c = tick(merge_clocks({}, b), "c")
+        print("c after hearing b:", c, " c vs a:", compare(c, a))
+        print("a vs a:", compare(a, dict(a)))
+        PY
+        cat > steps/delta.py <<'PY'
+        import json
+
+        from crdt import GCounter
+
+        # A counter shared by 500 devices. Every one has counted something.
+        big = GCounter("hub")
+        for n in range(500):
+            big.counts["device" + str(n)] = n % 7 + 1
+        known = dict(big.counts)       # what a friend already has
+
+        # Since then, two devices count more.
+        big.counts["device3"] += 2
+        big.counts["device42"] += 1
+
+        full = json.dumps(big.counts)
+        delta = json.dumps({name: count for name, count in big.counts.items() if count > known.get(name, 0)})
+        print("full state:", len(full), "bytes")
+        print("delta:", len(delta), "bytes", delta)
+
+        friend = GCounter("friend")
+        friend.counts = known
+        for name, count in json.loads(delta).items():
+            friend.counts[name] = max(friend.counts.get(name, 0), count)
+        print("friend after the delta:", friend.value(), " hub:", big.value())
+        PY
+        cat > steps/tombstones.py <<'PY'
+        from rga import Text
+
+        doc = Text("ana")
+        doc.insert(0, "x" * 200)
+        doc.delete(10, 190)               # delete the last 190 characters
+        print("visible:", len(doc.text()), " stored:", len(doc.chars), " tombstones:", doc.tombstones())
+        print("compacted once every replica has seen them:", doc.compact(seen_by_all=200))
+        print("stored now:", len(doc.chars))
+
+        start = Text("ben")
+        start.insert(0, "y" * 200)
+        start.delete(0, 190)              # delete the first 190 instead
+        print("deleted at the start, compacted:", start.compact(seen_by_all=200),
+              " tombstones still needed:", start.tombstones())
+        PY
+        cat > steps/offline.py <<'PY'
+        import random
+
+        from crdt import ORSet, PNCounter
+
+        # Three replicas, each offline, each doing 30 random edits. Then they sync in a random order.
+        rng = random.Random(11)
+        names = ["phone", "laptop", "tablet"]
+        sets = {name: ORSet(name) for name in names}
+        counts = {name: PNCounter(name) for name in names}
+        items = ["tea", "jam", "rice", "soap", "oats"]
+        for name in names:
+            for n in range(30):
+                item = rng.choice(items)
+                if rng.random() < 0.6:
+                    sets[name].add(item)
+                    counts[name].increment()
+                else:
+                    sets[name].remove(item)
+                    counts[name].decrement()
+
+        for name in names:
+            print(name, "offline:", sets[name].members(), counts[name].value())
+
+        for n in range(6):
+            one, other = rng.sample(names, 2)
+            sets[one].merge(sets[other])
+            counts[one].merge(counts[other])
+            print("sync", other, "into", one)
+        print("then every replica syncs with every other")
+        for name in names:
+            for other in names:
+                sets[name].merge(sets[other])
+                counts[name].merge(counts[other])
+        for name in names:
+            print(name, "after sync:", sets[name].members(), counts[name].value())
+        PY
+        cat > /tmp/lab/make.py <<'PY'
+        import json
+
+
+        def md(text):
+            return {"cell_type": "markdown", "metadata": {}, "source": text}
+
+
+        def code(text):
+            return {"cell_type": "code", "metadata": {}, "source": text, "outputs": [],
+                    "execution_count": None}
+
+
+        cells = [
+            md("# CRDTs you can read\n\ncrdt.py holds counters, a register, a set and vector clocks. "
+               "rga.py holds a small text CRDT. Each replica is a Python object: change two of them "
+               "offline, merge, and they agree. Run each cell with Shift and Enter."),
+            code("from crdt import GCounter\n\na, b = GCounter(\"a\"), GCounter(\"b\")\na.increment(2)\nb.increment(3)\na.merge(b)\nb.merge(a)\na.value(), b.value()"),
+            code("from crdt import ORSet\n\nx, y = ORSet(\"x\"), ORSet(\"y\")\nx.add(\"pen\")\ny.merge(x)\nx.remove(\"pen\")\ny.add(\"pen\")\nx.merge(y)\nx.members()"),
+            code("from rga import Text\n\none, two = Text(\"one\"), Text(\"two\")\none.insert(0, \"abc\")\ntwo.merge(one)\none.insert(3, \"!\")\ntwo.insert(0, \">\")\none.merge(two)\ntwo.merge(one)\none.text(), two.text()"),
+            md("## Your own question\n\nAdd a cell below. Does a merge order ever change the result? "
+               "What happens to an OR-set if a remove arrives before the add it saw? "
+               "How many tombstones does a busy document keep?"),
+        ]
+        book = {"cells": cells, "nbformat": 4, "nbformat_minor": 5,
+                "metadata": {"kernelspec": {"name": "python3", "display_name": "Python 3 (ipykernel)",
+                                            "language": "python"},
+                             "language_info": {"name": "python"}}}
+        with open("start.ipynb", "w") as out:
+            json.dump(book, out, indent=1)
+        PY
+        python3 /tmp/lab/make.py
+
+        exec jupyter lab --no-browser --ip=0.0.0.0 --port=8888 \
+          --ServerApp.root_dir=/home/jovyan/work \
+          --IdentityProvider.token= --ServerApp.password= \
+          '--ServerApp.allow_origin=*' --ServerApp.allow_remote_access=True \
+          --LabApp.check_for_updates_class=jupyterlab.NeverCheckForUpdate \
+          --LabApp.news_url=None
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/api', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    labels:
+      lab.title: JupyterLab
+      lab.open: "8888"
